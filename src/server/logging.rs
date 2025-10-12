@@ -225,7 +225,7 @@ impl HttpLogData {
 async fn capture_log_data<Body, ResBody, Error, State: StateLogData>(
     inner: &impl Service<Request<Body>, Response = Response<ResBody>, Error = Error>,
     req: Request<Body>,
-) -> Result<(Response<ResBody>, HttpLogData), Error> {
+) -> Result<(Result<Response<ResBody>, Error>, HttpLogData), ()> {
     let start = time::Instant::now();
 
     // Extract request info for logging
@@ -237,10 +237,13 @@ async fn capture_log_data<Body, ResBody, Error, State: StateLogData>(
     let user_agent: LogOption<_> = req.headers().get(hyper::header::USER_AGENT).cloned().into();
 
     // Make the request
-    let res = inner.call(req, None).await?;
+    let res = inner.call(req, None).await;
 
     // Extract response info for logging
-    let status = res.status().as_u16() as i16;
+    let status = match &res {
+        Ok(response) => response.status().as_u16() as i16,
+        Err(_) => 0, // Use 0 for error cases where no HTTP status is available
+    };
     let elapsed = start.elapsed().as_millis() as i64;
 
     let log_data = HttpLogData {
@@ -272,12 +275,14 @@ where
         req: Request<Body>,
         _: Option<IpAddr>,
     ) -> Result<Self::Response, Self::Error> {
-        let (res, log_data) = capture_log_data::<_, _, _, State>(&self.inner, req).await?;
+        let (res, log_data) = capture_log_data::<_, _, _, State>(&self.inner, req)
+            .await
+            .expect("capture_log_data should never fail");
 
         log_data.log();
         send_http_event(log_data);
 
-        Ok(res)
+        res
     }
 }
 
@@ -411,9 +416,11 @@ mod tests {
             .body(())
             .unwrap();
 
-        let (_, log_data) = capture_log_data::<_, _, _, MockState>(&Svc, req)
+        let (res, log_data) = capture_log_data::<_, _, _, MockState>(&Svc, req)
             .await
             .unwrap();
+        
+        assert!(res.is_ok());
 
         assert_eq!(log_data.state_data.ip, IpAddr::V4([127, 0, 0, 1].into()));
         assert_eq!(log_data.method, Method::GET);
@@ -444,6 +451,68 @@ mod tests {
     fn log_option_from_option() {
         assert_eq!(LogOption::<u8>::from(None), LogOption::None);
         assert_eq!(LogOption::from(Some(1)), LogOption::Some(1));
+    }
+
+    #[tokio::test]
+    async fn log_capture_on_error() {
+        #[derive(Clone)]
+        struct MockState;
+
+        impl StateLogData for MockState {
+            fn get_state_data(&self) -> StateData {
+                StateData {
+                    uuid: uuid::Uuid::now_v7(),
+                    ip: IpAddr::V4([127, 0, 0, 1].into()),
+                    target: "test",
+                    worker_id: 1,
+                    worker_route: None,
+                }
+            }
+        }
+
+        struct FailingSvc;
+
+        impl Service<Request<()>> for FailingSvc {
+            type Response = Response<()>;
+            type Error = &'static str;
+            async fn call(
+                &self,
+                _: Request<()>,
+                _: Option<IpAddr>,
+            ) -> Result<Self::Response, Self::Error> {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                Err("Service failed")
+            }
+        }
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/protected")
+            .extension(MockState)
+            .version(Version::HTTP_11)
+            .header(hyper::header::USER_AGENT, "test")
+            .body(())
+            .unwrap();
+
+        let (res, log_data) = capture_log_data::<_, _, _, MockState>(&FailingSvc, req)
+            .await
+            .unwrap();
+        
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "Service failed");
+
+        // Verify log data was still captured
+        assert_eq!(log_data.state_data.ip, IpAddr::V4([127, 0, 0, 1].into()));
+        assert_eq!(log_data.method, Method::POST);
+        assert_eq!(log_data.path, "https://example.com/protected");
+        assert_eq!(log_data.version, Version::HTTP_11);
+        assert_eq!(log_data.status, 0); // Error status
+        assert_eq!(
+            log_data.user_agent,
+            LogOption::Some(HeaderValue::from_static("test"))
+        );
+        assert!(log_data.elapsed > 0);
+        assert_eq!(log_data.state_data.target, "test");
     }
 
     #[test]
